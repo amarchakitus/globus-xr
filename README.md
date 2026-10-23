@@ -12,12 +12,12 @@ ds = xr.open_zarr("globus://<collection_id>/path/to/store.zarr")
 ## Installation
 
 ```bash
-pip install "globus-xr[xarray] @ git+https://github.com/OWNER/globus-xr"
+pip install globus-xr
 ```
 
-Install it into the same environment as xarray. Leave off `[xarray]` if that
-environment already has xarray, zarr and dask. Requires Python 3.10+. Zarr v3
-stores need zarr 3, which needs Python 3.11+.
+Install it into the environment where you use xarray. In a fresh environment,
+`pip install "globus-xr[xarray]"` also installs xarray, zarr and dask.
+Requires Python 3.10+. Zarr v3 stores need zarr 3, which needs Python 3.11+.
 
 ## Quick start
 
