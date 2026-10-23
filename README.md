@@ -109,3 +109,7 @@ stores concurrently:
 uv sync         # installs the package plus xarray, zarr, dask and pytest
 uv run pytest
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
