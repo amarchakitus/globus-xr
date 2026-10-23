@@ -322,6 +322,172 @@ def test_suffix_range_longer_than_file(fs, gcs):
     assert fs.cat_file(url, start=-100) == b"abc"
 
 
+def test_suffix_reads_look_up_size_once(fs, gcs):
+    # zarr reads a shard's index for every chunk it reads from that shard.
+    url = put(gcs, "shard.bin")
+    for _ in range(3):
+        assert fs.cat_file(url, start=-16) == PAYLOAD[-16:]
+    heads = [s for s in gcs.log if s.method == "HEAD"]
+    assert len(heads) == 1
+
+
+def test_concurrent_suffix_reads_share_one_fetch(gcs):
+    import asyncio
+
+    url = put(gcs, "shard.bin")
+    fs = GlobusFileSystem(skip_instance_cache=True, asynchronous=True)
+
+    async def read_many():
+        session = await fs.set_session()
+        try:
+            return await asyncio.gather(
+                *(fs._cat_file(url, start=-16) for _ in range(8))
+            )
+        finally:
+            await session.close()
+
+    assert asyncio.run(read_many()) == [PAYLOAD[-16:]] * 8
+    assert [s.method for s in gcs.log] == ["HEAD", "GET"]
+
+
+def test_failed_size_lookup_is_retried(fs, gcs):
+    url = f"globus://{COLLECTION}/later.bin"
+    with pytest.raises(FileNotFoundError):
+        fs.cat_file(url, start=-16)
+    put(gcs, "later.bin")
+    assert fs.cat_file(url, start=-16) == PAYLOAD[-16:]
+
+
+def run_async(fs, *coros):
+    """Run coroutines concurrently on one session of an asynchronous fs."""
+    import asyncio
+
+    async def main():
+        session = await fs.set_session()
+        try:
+            return await asyncio.gather(*coros, return_exceptions=True)
+        finally:
+            await session.close()
+
+    return asyncio.run(main())
+
+
+@pytest.fixture
+def afs(gcs):
+    return GlobusFileSystem(skip_instance_cache=True, asynchronous=True)
+
+
+def ranged_gets(gcs):
+    return [s.headers.get("Range") for s in gcs.log if s.method == "GET"]
+
+
+def test_concurrent_range_reads_are_merged(afs, gcs):
+    url = put(gcs, "shard.bin")
+    spans = [(0, 100), (100, 300), (300, 301), (500, 1024), (40, 60)]
+    out = run_async(afs, *(afs._cat_file(url, a, b) for a, b in spans))
+    assert out == [PAYLOAD[a:b] for a, b in spans]
+    assert ranged_gets(gcs) == ["bytes=0-1023"]
+
+
+def test_far_apart_ranges_are_read_separately(afs, gcs, monkeypatch):
+    from globus_xr import fs as fs_module
+
+    monkeypatch.setattr(fs_module, "COALESCE_MAX_GAP", 100)
+    url = put(gcs, "shard.bin")
+    out = run_async(afs, afs._cat_file(url, 0, 10), afs._cat_file(url, 500, 510))
+    assert out == [PAYLOAD[0:10], PAYLOAD[500:510]]
+    assert sorted(ranged_gets(gcs)) == ["bytes=0-9", "bytes=500-509"]
+
+
+def test_merged_requests_are_capped_in_size(afs, gcs, monkeypatch):
+    from globus_xr import fs as fs_module
+
+    monkeypatch.setattr(fs_module, "COALESCE_MAX_BYTES", 512)
+    url = put(gcs, "shard.bin")
+    spans = [(i, i + 128) for i in range(0, 1024, 128)]
+    out = run_async(afs, *(afs._cat_file(url, a, b) for a, b in spans))
+    assert out == [PAYLOAD[a:b] for a, b in spans]
+    assert sorted(ranged_gets(gcs)) == ["bytes=0-511", "bytes=512-1023"]
+
+
+def test_reads_of_different_files_are_not_merged(afs, gcs):
+    a, b = put(gcs, "a.bin"), put(gcs, "b.bin", PAYLOAD[::-1])
+    out = run_async(afs, afs._cat_file(a, 0, 4), afs._cat_file(b, 0, 4))
+    assert out == [PAYLOAD[:4], PAYLOAD[::-1][:4]]
+    assert len(ranged_gets(gcs)) == 2
+
+
+def test_merged_read_past_end_of_file_still_fails_alone(afs, gcs):
+    url = put(gcs, "small.bin", b"0123456789")
+    ok, past_end = run_async(afs, afs._cat_file(url, 2, 5), afs._cat_file(url, 20, 30))
+    assert ok == b"234"
+    assert isinstance(past_end, Exception)  # as when read on its own (416)
+
+
+def test_merged_read_error_reaches_every_caller(afs, gcs, app):
+    url = put(gcs, "shard.bin")
+    app.token = "wrong"
+    out = run_async(afs, afs._cat_file(url, 0, 4), afs._cat_file(url, 8, 12))
+    assert len(out) == 2
+    assert all(isinstance(e, OSError) for e in out)
+    assert all("Globus refused access" in str(e) for e in out)
+
+
+def test_cancelled_read_does_not_strand_the_others(afs, gcs):
+    import asyncio
+
+    url = put(gcs, "shard.bin")
+
+    async def cancel_one():
+        doomed = asyncio.ensure_future(afs._cat_file(url, 0, 4))
+        await asyncio.sleep(0)
+        doomed.cancel()
+        return await afs._cat_file(url, 8, 12)
+
+    assert run_async(afs, cancel_one()) == [PAYLOAD[8:12]]
+
+
+def test_file_tails_are_fetched_once(fs, gcs):
+    url = put(gcs, "shard.bin")
+    for _ in range(3):
+        assert fs.cat_file(url, start=-16) == PAYLOAD[-16:]
+    assert fs.cat_file(url, start=-8) == PAYLOAD[-8:]  # a different tail
+    gets = [s for s in gcs.log if s.method == "GET"]
+    assert len(gets) == 2
+
+
+def test_large_tails_and_other_ranges_are_not_cached(fs, gcs):
+    from globus_xr.fs import MAX_CACHED_TAIL
+
+    data = bytes(MAX_CACHED_TAIL + 10)
+    url = put(gcs, "big.bin", data)
+    n = MAX_CACHED_TAIL + 1
+    for _ in range(2):
+        assert fs.cat_file(url, start=-n) == data[-n:]
+        assert fs.cat_file(url, start=0, end=4) == data[:4]
+    gets = [s for s in gcs.log if s.method == "GET"]
+    assert len(gets) == 4
+
+
+def test_invalidate_cache_forgets_sizes_and_tails(fs, gcs):
+    url = put(gcs, "shard.bin")
+    fs.cat_file(url, start=-4)
+    put(gcs, "shard.bin", b"0123456789")
+    fs.invalidate_cache()
+    assert fs.cat_file(url, start=-4) == b"6789"
+
+
+def test_suffix_read_without_size_raises(fs, gcs, monkeypatch):
+    url = put(gcs, "file.bin")
+
+    async def no_size(url, **kwargs):
+        return {"name": url, "size": None, "type": "file"}
+
+    monkeypatch.setattr(fs, "_info", no_size)
+    with pytest.raises(OSError, match="didn't report the size"):
+        fs.cat_file(url, start=-16)
+
+
 def test_absolute_ranges(fs, gcs):
     url = put(gcs, "file.bin")
     assert fs.cat_file(url, start=10, end=20) == PAYLOAD[10:20]
@@ -520,6 +686,28 @@ def test_sessions_verify_https_with_certifi():
     with open(certifi.where()) as bundle:
         assert loaded == bundle.read().count("BEGIN CERTIFICATE") > 0
     assert custom is own  # a caller's own connector wins
+    assert default.limit_per_host == fs_module.MAX_CONNECTIONS
+
+
+def test_max_connections(gcs):
+    import asyncio
+
+    async def limit(fs):
+        session = await fs.set_session()
+        try:
+            return session.connector.limit_per_host
+        finally:
+            await session.close()
+
+    from globus_xr.fs import MAX_CONNECTIONS
+
+    default = GlobusFileSystem(skip_instance_cache=True, asynchronous=True)
+    assert asyncio.run(limit(default)) == MAX_CONNECTIONS
+    # e.g. xr.open_zarr(url, storage_options={"max_connections": 4})
+    fewer = GlobusFileSystem(
+        skip_instance_cache=True, asynchronous=True, max_connections=4
+    )
+    assert asyncio.run(limit(fewer)) == 4
 
 
 def test_filesystem_pickles():

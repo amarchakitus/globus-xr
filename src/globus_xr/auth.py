@@ -11,6 +11,8 @@ from __future__ import annotations
 import functools
 import json
 import os
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -21,6 +23,10 @@ from globus_sdk.login_flows import (
     LocalServerEnvironmentalLoginError,
     LocalServerLoginFlowManager,
     LoginFlowManager,
+)
+from globus_sdk.login_flows.local_server_login_flow_manager.local_server import (
+    RedirectHandler,
+    RedirectHTTPServer,
 )
 from globus_sdk.scopes import GCSCollectionScopes
 from globus_sdk.token_storage import TokenValidationError
@@ -43,6 +49,8 @@ DISCOVERY_SCOPES = ("recently-used", "my-endpoints", "shared-with-me", "administ
 _HOSTS: dict[str, str] = {}
 # Collection ID -> Transfer endpoint document, from lookups and discovery.
 _DOCS: dict[str, dict] = {}
+# Held while logging in on demand, so parallel opens share one login.
+_LOGIN_LOCK = threading.RLock()
 
 
 # --- Client ID and app -------------------------------------------------------
@@ -80,6 +88,41 @@ def _client_id() -> str:
     )
 
 
+class _QuietRedirectHandler(RedirectHandler):
+    def log_message(self, format, *args):
+        # http.server logs each request to stderr, and the redirect's query
+        # string holds the authorization code.
+        pass
+
+
+class _Browser(LocalServerLoginFlowManager):
+    """The SDK's local-server login, but saying what's happening: on its own it
+    opens a browser tab and waits silently, which in a notebook looks stuck."""
+
+    def _get_authorize_url(self, auth_parameters, redirect_uri):
+        url = super()._get_authorize_url(auth_parameters, redirect_uri)
+        print(
+            "\nLog in to Globus in your browser. If no browser window opened, "
+            f"go to:\n\n  {url}\n",
+            flush=True,
+        )
+        return url
+
+    @contextmanager
+    def background_local_server(self):
+        server = RedirectHTTPServer(
+            server_address=self.server_address,
+            handler_class=_QuietRedirectHandler,
+            html_template=self.html_template,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server
+        finally:
+            server.shutdown()
+
+
 class _BrowserOrPaste(LoginFlowManager):
     """Log in through a local browser, which hands the code back automatically,
     or fall back to pasting it (over SSH, or with no usable browser)."""
@@ -92,7 +135,7 @@ class _BrowserOrPaste(LoginFlowManager):
     @classmethod
     def for_globus_app(cls, app_name, login_client, config):
         return cls(
-            LocalServerLoginFlowManager.for_globus_app(app_name, login_client, config),
+            _Browser.for_globus_app(app_name, login_client, config),
             CommandLineLoginFlowManager.for_globus_app(app_name, login_client, config),
         )
 
@@ -267,8 +310,9 @@ def https_server(collection_id: str) -> str:
     """Look up a collection's HTTPS base URL, logging in if it isn't authorized yet."""
     app = get_app()
     _require([collection_id])
-    if app.login_required():
-        login([collection_id])
+    with _LOGIN_LOCK:
+        if app.login_required():
+            login([collection_id])
     doc = _endpoint_doc(collection_id)
     if not doc.get("https_server"):
         raise ValueError(

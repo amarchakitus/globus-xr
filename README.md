@@ -95,6 +95,22 @@ stores concurrently:
 - pass `parallel=True` to `open_mfdataset`
 - pass `zarr_format=3, consolidated=True` for consolidated Zarr v3 stores
 
+globus-xr merges reads of nearby byte ranges in a file that arrive together,
+such as dask reading many chunks of one Zarr shard, into a few large requests.
+dask runs one task per CPU core by default, and these tasks mostly wait on the
+network, so more threads let more reads merge:
+
+```python
+import dask
+
+with dask.config.set(num_workers=64):
+    ds["t_850"].isel(time=0).load()
+```
+
+Each filesystem opens at most 16 connections per server, so dask can't
+overload it. Raise or lower the limit with
+`storage_options={"max_connections": n}`.
+
 ## Notes
 
 - Access is read-only.
