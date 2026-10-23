@@ -1,0 +1,41 @@
+[project]
+name = "globus-xr"
+version = "0.1.0"
+description = "Open Globus collections with xarray, zarr and fsspec via globus:// URLs"
+readme = "README.md"
+authors = [
+    { name = "amarchakitus", email = "marchakitus@uchicago.edu" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.12",  # client middlewares, which add the Globus token to each request
+    "certifi",
+    "fsspec>=2023.12.0",
+    "globus-sdk>=4",
+    "prompt-toolkit>=3.0.36",
+    "questionary>=2.1.1",  # 2.1.0 breaks with prompt-toolkit>=3.0.52
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+# Not needed by globus-xr itself; for opening data with xarray in a fresh env.
+xarray = ["xarray", "zarr", "dask"]
+
+[dependency-groups]
+dev = [
+    "xarray",
+    "zarr",
+    "dask",
+    "h5netcdf",
+    "pytest>=9.1.1",
+]
+
+[project.scripts]
+globus-xr = "globus_xr.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[project.entry-points."fsspec.specs"]
+globus = "globus_xr.fs:GlobusFileSystem"
